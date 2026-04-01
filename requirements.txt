@@ -4,7 +4,7 @@ datasets==3.4.1
 wandb 
 trl
 accelerate
-snac
+fast-snac @ git+https://github.com/kadirnar/fast-snac.git
 soundfile
 librosa
 torchaudio
