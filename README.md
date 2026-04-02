@@ -15,7 +15,7 @@
         <img src="https://img.shields.io/badge/License-MIT-4ECDC4?style=for-the-badge&labelColor=2D3748" alt="MIT License">
     </a>
     <a href="https://python.org" target="_blank">
-        <img src="https://img.shields.io/badge/Python-3.8+-45B7D1?style=for-the-badge&logo=python&logoColor=white&labelColor=2D3748" alt="Python 3.8+">
+        <img src="https://img.shields.io/badge/Python-3.10+-45B7D1?style=for-the-badge&logo=python&logoColor=white&labelColor=2D3748" alt="Python 3.10+">
     </a>
     <a href="https://huggingface.co/spaces/Vyvo/VyvoTTS-LFM2" target="_blank">
         <img src="https://img.shields.io/badge/🤗_Hugging_Face-Spaces-FFD93D?style=for-the-badge&labelColor=2D3748" alt="HuggingFace Spaces">
@@ -25,27 +25,48 @@
 
 ## Installation
 
+> **Note:** vLLM and SGLang need different torch versions, so use separate environments.
+
 ```bash
-uv venv --python 3.10
-uv pip install -r requirements.txt
+# vLLM backend (recommended)
+pip install vyvotts[vllm]
+
+# SGLang backend
+pip install vyvotts[sglang]
+
+# Training
+pip install vyvotts[train]
+```
+
+Or install from source:
+
+```bash
+git clone https://github.com/Vyvo-Labs/VyvoTTS.git
+cd VyvoTTS
+
+# vLLM
+pip install -e ".[vllm]"
+
+# SGLang
+pip install -e ".[sglang]"
 ```
 
 ## Inference
 
 ```python
-from vyvotts.inference import VyvoTTSSGLangInference
+from vyvotts.inference.vllm_inference import VyvoTTSInference
 
-engine = VyvoTTSSGLangInference(model_name="Vyvo/VyvoTTS-LFM2-Neuvillette")
+engine = VyvoTTSInference(model_name="Vyvo/VyvoTTS-LFM2-Neuvillette")
 audio = engine.generate("Hello world", output_path="output.wav")
 ```
 
 Switch backend by changing the import:
 
 ```python
-from vyvotts.inference import VyvoTTSSGLangInference       # SGLang — fastest throughput
-from vyvotts.inference import VyvoTTSvLLMInference         # vLLM — lowest latency
-from vyvotts.inference import VyvoTTSTransformersInference  # Transformers — no extra deps
-from vyvotts.inference import VyvoTTSUnslothInference       # Unsloth — memory efficient
+from vyvotts.inference.vllm_inference import VyvoTTSInference              # vLLM
+from vyvotts.inference.sglang_inference import VyvoTTSSGLangInference      # SGLang
+from vyvotts.inference.transformers_inference import VyvoTTSTransformersInference  # Transformers
+from vyvotts.inference.unsloth_inference import VyvoTTSUnslothInference    # Unsloth
 ```
 
 ### Benchmark (Qwen3-1.7B, H100 PCIe)

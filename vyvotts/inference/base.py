@@ -21,7 +21,7 @@ class BaseVyvoTTSInference:
 
     CODES_PER_GROUP = 7
     SAMPLE_RATE = 24000
-    DEFAULT_CONFIG_PATH = "vyvotts/configs/inference/lfm2.yaml"
+    DEFAULT_CONFIG_PATH = "vyvotts/configs/inference/qwen3.yaml"
 
     def __init__(
         self,
@@ -160,6 +160,11 @@ class BaseVyvoTTSInference:
             codes[:, 5] - 5 * 4096,
             codes[:, 6] - 6 * 4096,
         ], dim=1).reshape(-1)
+
+        # Clamp to valid codebook range (0-4095)
+        layer_0 = layer_0.clamp(0, 4095)
+        layer_1 = layer_1.clamp(0, 4095)
+        layer_2 = layer_2.clamp(0, 4095)
 
         snac_codes = [layer.unsqueeze(0).to(device) for layer in (layer_0, layer_1, layer_2)]
         if hasattr(self, '_optimized_decode'):

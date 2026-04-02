@@ -42,22 +42,8 @@ class VyvoTTSInference(BaseVyvoTTSInference):
         max_tokens: int = 1200,
         repetition_penalty: float = 1.3,
     ) -> Optional[torch.Tensor]:
-        """Generate speech from text input.
-
-        Args:
-            text: Input text to convert to speech.
-            voice: Optional voice identifier.
-            output_path: Optional path to save audio file.
-            temperature: Sampling temperature.
-            top_p: Top-p sampling parameter.
-            max_tokens: Maximum tokens to generate.
-            repetition_penalty: Penalty for token repetition.
-
-        Returns:
-            Audio tensor containing the generated speech, or None on failure.
-        """
+        """Generate speech from text input."""
         prompt_ids = self._build_prompt_tokens(text, voice)
-        final_prompt = self.tokenizer.decode(prompt_ids[0])
 
         params = SamplingParams(
             temperature=temperature,
@@ -67,7 +53,10 @@ class VyvoTTSInference(BaseVyvoTTSInference):
             repetition_penalty=repetition_penalty,
         )
 
-        outputs = self.engine.generate([final_prompt], [params])
+        outputs = self.engine.generate(
+            [{"prompt_token_ids": prompt_ids[0].tolist()}],
+            [params],
+        )
         token_ids = outputs[0].outputs[0].token_ids
         generated_ids = torch.tensor([token_ids], dtype=torch.long)
 
@@ -80,16 +69,8 @@ class VyvoTTSInference(BaseVyvoTTSInference):
         return audio
 
 
-def text_to_speech(
-    prompt: str,
-    voice: Optional[str] = None,
-    config_path: Optional[str] = None,
-) -> Optional[torch.Tensor]:
-    """Generate speech from text using vLLM engine."""
-    engine = VyvoTTSInference(config_path=config_path)
-    return engine.generate(prompt, voice)
-
-
 if __name__ == "__main__":
-    audio_output = text_to_speech("Hello world", voice="zoe")
-    print("Decoded audio (tensors):", audio_output)
+    engine = VyvoTTSInference(model_name="Vyvo/VyvoTTS-EN-Beta")
+    audio = engine.generate("Hello world", output_path="output.wav")
+    if audio is not None:
+        print(f"Audio: {audio.shape[-1]/24000:.2f}s")
