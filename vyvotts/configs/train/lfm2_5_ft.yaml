@@ -1,0 +1,23 @@
+# Model
+model_name: "LiquidAI/LFM2.5-350M"
+tokenizer_name: "LiquidAI/LFM2-350M"  # LFM2.5 uses same tokenizer base
+
+# Codec
+codec_type: "mimi"
+num_codebooks: 8           # mimi: 1-32 (default 8)
+
+# Dataset — local path or HuggingFace repo
+TTS_dataset: "/scratch/kadirnar/emilia-subset-mimi-lfm2_5"
+
+# Training Args
+epochs: 1
+batch_size: 16
+number_processes: 8
+pad_token: 64407
+save_steps: 5000
+learning_rate: 5.0e-5
+
+# Naming and paths
+save_folder: "/scratch/kadirnar/checkpoints/lfm2_5-ft"
+project_name: "lfm2_5-tts-mimi"
+run_name: "lfm2_5-tts-mimi-ft"

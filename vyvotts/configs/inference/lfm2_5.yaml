@@ -1,4 +1,4 @@
-CODEC_TYPE: "snac"          # "snac" or "mimi"
+CODEC_TYPE: "mimi"          # "snac" or "mimi"
 CODEC_MODEL: null            # null = default model per codec type
 NUM_CODEBOOKS: 8             # mimi: 1-32 (default 8), snac: ignored
 

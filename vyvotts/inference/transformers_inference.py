@@ -14,21 +14,22 @@ class VyvoTTSTransformersInference(BaseVyvoTTSInference):
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
-        snac_model_name: str = "hubertsiuzdak/snac_24khz",
+        tokenizer_name: Optional[str] = None,
+        codec_type: str = "snac",
+        codec_model_name: str = None,
         device: str = "cuda",
         attn_implementation: str = "sdpa",
     ):
         super().__init__(config, config_path)
         self.device = device
 
-        self.snac_model = self._load_snac_model(snac_model_name, device=device)
+        self.codec = self._load_codec(codec_type, codec_model_name, device=device)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             attn_implementation=attn_implementation,
-            device_map="auto",
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        ).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name or model_name)
 
     def generate(
         self,

@@ -14,7 +14,9 @@ class VyvoTTSInference(BaseVyvoTTSInference):
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
-        snac_model_name: str = "hubertsiuzdak/snac_24khz",
+        tokenizer_name: Optional[str] = None,
+        codec_type: str = "snac",
+        codec_model_name: str = None,
         enforce_eager: bool = False,
         max_model_len: int = 2048,
         gpu_memory_utilization: float = 0.95,
@@ -29,8 +31,8 @@ class VyvoTTSInference(BaseVyvoTTSInference):
             gpu_memory_utilization=gpu_memory_utilization,
             **llm_kwargs,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.snac_model = self._load_snac_model(snac_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name or model_name)
+        self.codec = self._load_codec(codec_type, codec_model_name)
 
     def generate(
         self,

@@ -1,11 +1,13 @@
 import os
 import yaml
 import torch
+import torch.multiprocessing as mp
 import torchaudio.transforms as T
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from huggingface_hub import snapshot_download
-from snac import SNAC
 from transformers import AutoTokenizer
+
+from vyvotts.codec import load_codec
 
 
 def load_config(config_path):
@@ -23,13 +25,13 @@ def load_config(config_path):
     return config
 
 
-def tokenise_audio(waveform, snac_model, ds_sample_rate, target_sample_rate, audio_tokens_start):
+def tokenise_audio(waveform, codec, ds_sample_rate, target_sample_rate, audio_tokens_start):
     """
-    Tokenize audio waveform using SNAC codec.
+    Tokenize audio waveform using the audio codec.
 
     Args:
         waveform: Audio array from dataset
-        snac_model: SNAC model instance
+        codec: Codec instance (SNACCodec or MimiCodec)
         ds_sample_rate: Original dataset sample rate
         target_sample_rate: Target sample rate (24000)
         audio_tokens_start: Offset for audio tokens
@@ -38,91 +40,121 @@ def tokenise_audio(waveform, snac_model, ds_sample_rate, target_sample_rate, aud
         List of audio token IDs with proper offsets applied
     """
     # Convert to tensor and prepare for processing
+    import numpy as np
+    if not isinstance(waveform, np.ndarray):
+        waveform = np.array(waveform, dtype=np.float32)
     waveform = torch.from_numpy(waveform).unsqueeze(0)
     waveform = waveform.to(dtype=torch.float32)
 
     # Resample to target sample rate if needed
     resample_transform = T.Resample(orig_freq=ds_sample_rate, new_freq=target_sample_rate)
     waveform = resample_transform(waveform)
-    waveform = waveform.unsqueeze(0).to("cuda")
+    waveform = waveform.unsqueeze(0)  # [1, 1, T]
 
-    # Generate SNAC codes
-    with torch.inference_mode():
-        codes = snac_model.encode(waveform)
+    # Encode with codec — returns interleaved codes with per-codebook offsets
+    codes = codec.encode(waveform)
 
-    # Interleave codes from 3 codebooks with proper offsets
-    # SNAC uses hierarchical vector quantization with 3 levels
-    all_codes = []
-    num_frames = codes[0].shape[1]
-
-    for i in range(num_frames):
-        # Level 0: 1 code per frame
-        all_codes.append(codes[0][0][i].item() + audio_tokens_start)
-
-        # Level 1: 2 codes per frame
-        all_codes.append(codes[1][0][2*i].item() + audio_tokens_start + 4096)
-
-        # Level 2: 4 codes per frame
-        all_codes.append(codes[2][0][4*i].item() + audio_tokens_start + (2 * 4096))
-        all_codes.append(codes[2][0][4*i + 1].item() + audio_tokens_start + (3 * 4096))
-
-        # Continue level 1 and 2 interleaving
-        all_codes.append(codes[1][0][2*i + 1].item() + audio_tokens_start + (4 * 4096))
-        all_codes.append(codes[2][0][4*i + 2].item() + audio_tokens_start + (5 * 4096))
-        all_codes.append(codes[2][0][4*i + 3].item() + audio_tokens_start + (6 * 4096))
-
-    return all_codes
+    # Add audio_tokens_start offset
+    return [c + audio_tokens_start for c in codes]
 
 
-def remove_duplicate_frames(codes_list):
+def remove_duplicate_frames(codes_list, codes_per_group):
     """
     Remove consecutive duplicate audio frames to reduce redundancy.
 
-    Each frame consists of 7 codes (1 + 2 + 4 from 3 SNAC codebook levels).
+    Each frame consists of codes_per_group codes.
     Frames with identical first codes are considered duplicates.
 
     Args:
         codes_list: List of audio codes
+        codes_per_group: Number of codes per frame group
 
     Returns:
         Deduplicated codes list
     """
-    if len(codes_list) % 7 != 0:
-        raise ValueError("Input list length must be divisible by 7")
+    if len(codes_list) % codes_per_group != 0:
+        raise ValueError(f"Input list length must be divisible by {codes_per_group}")
 
     # Keep first frame
-    result = codes_list[:7]
+    result = codes_list[:codes_per_group]
     removed_frames = 0
 
     # Check each subsequent frame
-    for i in range(7, len(codes_list), 7):
+    for i in range(codes_per_group, len(codes_list), codes_per_group):
         current_first_code = codes_list[i]
-        previous_first_code = result[-7]
+        previous_first_code = result[-codes_per_group]
 
         if current_first_code != previous_first_code:
-            result.extend(codes_list[i:i+7])
+            result.extend(codes_list[i:i + codes_per_group])
         else:
             removed_frames += 1
 
     return result
 
 
+def _encode_shard(rank, num_gpus, dataset_shard, codec_type, codec_model_name,
+                  ds_sample_rate, target_sample_rate, audio_tokens_start, return_dict):
+    """Worker function: encode a dataset shard on a specific GPU.
+
+    Args:
+        rank: GPU index (0, 1, 2, ...).
+        num_gpus: Total number of GPUs.
+        dataset_shard: HuggingFace Dataset shard to process.
+        codec_type: "snac" or "mimi".
+        codec_model_name: HuggingFace model ID (None for default).
+        ds_sample_rate: Original audio sample rate.
+        target_sample_rate: Target sample rate (24000).
+        audio_tokens_start: Token offset for audio tokens.
+        return_dict: Shared dict to store results.
+    """
+    device = f"cuda:{rank}"
+    print(f"[GPU {rank}] Loading {codec_type} codec on {device}...")
+    codec = load_codec(codec_type=codec_type, model_name=codec_model_name, device=device)
+
+    def add_codes(example):
+        codes_list = None
+        try:
+            audio_data = example.get("audio")
+            if audio_data and "array" in audio_data:
+                codes_list = tokenise_audio(
+                    audio_data["array"], codec,
+                    ds_sample_rate, target_sample_rate, audio_tokens_start,
+                )
+        except Exception as e:
+            print(f"[GPU {rank}] Skipping row: {e}")
+        example["codes_list"] = codes_list
+        return example
+
+    print(f"[GPU {rank}] Encoding {len(dataset_shard)} examples...")
+    encoded = dataset_shard.map(add_codes, remove_columns=["audio"])
+    return_dict[rank] = encoded
+    print(f"[GPU {rank}] Done.")
+
+
 def process_dataset(
     original_dataset,
     output_dataset,
     model_type="qwen3",
+    codec_type="snac",
+    codec_model_name=None,
     text_field="text_scribe",
-    target_sample_rate=24000
+    target_sample_rate=24000,
+    num_gpus=None,
 ):
     """
     Process dataset: tokenize audio and text, create training sequences.
+
+    Automatically shards audio encoding across all available GPUs.
 
     Args:
         original_dataset: HuggingFace dataset path to process
         output_dataset: HuggingFace dataset path for output
         model_type: Model type - either "qwen3" or "lfm2" (default: "qwen3")
+        codec_type: Audio codec type - "snac" or "mimi" (default: "snac")
+        codec_model_name: HuggingFace model ID for codec (None for default)
         text_field: Name of text field in dataset (default: "text_scribe")
         target_sample_rate: Target audio sample rate (default: 24000)
+        num_gpus: Number of GPUs to use (default: all available)
     """
     # Set tokenizer and config based on model type
     if model_type == "qwen3":
@@ -131,8 +163,11 @@ def process_dataset(
     elif model_type == "lfm2":
         tokenizer_model = "LiquidAI/LFM2-350M"
         config_path = "vyvotts/configs/inference/lfm2.yaml"
+    elif model_type == "lfm2_5":
+        tokenizer_model = "LiquidAI/LFM2-350M"  # same tokenizer as LFM2
+        config_path = "vyvotts/configs/inference/lfm2_5.yaml"
     else:
-        raise ValueError(f"Invalid model_type: {model_type}. Must be 'qwen3' or 'lfm2'")
+        raise ValueError(f"Invalid model_type: {model_type}. Must be 'qwen3', 'lfm2', or 'lfm2_5'")
 
     # Load configuration
     print(f"Loading config from: {config_path}")
@@ -164,36 +199,66 @@ def process_dataset(
     ds = load_dataset(original_dataset, split="train")
     ds_sample_rate = ds[0]["audio"]["sampling_rate"]
 
-    # Load SNAC model
-    print("Loading SNAC model: hubertsiuzdak/snac_24khz")
-    snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
-    snac_model = snac_model.to("cuda")
+    # Determine number of GPUs
+    available_gpus = torch.cuda.device_count()
+    if num_gpus is None:
+        num_gpus = available_gpus
+    num_gpus = min(num_gpus, available_gpus)
+    assert num_gpus > 0, "No CUDA GPUs available"
 
-    # Define processing functions
-    def add_codes(example):
-        """Add audio codes to dataset example."""
-        codes_list = None
+    print(f"Using {num_gpus} GPU(s) for audio encoding")
 
-        try:
-            audio_data = example.get("audio")
-            if audio_data and "array" in audio_data:
-                audio_array = audio_data["array"]
-                codes_list = tokenise_audio(
-                    audio_array,
-                    snac_model,
-                    ds_sample_rate,
-                    target_sample_rate,
-                    AUDIO_TOKENS_START
-                )
-        except Exception as e:
-            print(f"Skipping row due to error: {e}")
+    if num_gpus == 1:
+        # Single-GPU path (no multiprocessing overhead)
+        print(f"Loading {codec_type} codec on cuda:0...")
+        codec = load_codec(codec_type=codec_type, model_name=codec_model_name, device="cuda:0")
+        codes_per_group = codec.codes_per_group
 
-        example["codes_list"] = codes_list
-        return example
+        def add_codes(example):
+            codes_list = None
+            try:
+                audio_data = example.get("audio")
+                if audio_data and "array" in audio_data:
+                    codes_list = tokenise_audio(
+                        audio_data["array"], codec,
+                        ds_sample_rate, target_sample_rate, AUDIO_TOKENS_START,
+                    )
+            except Exception as e:
+                print(f"Skipping row due to error: {e}")
+            example["codes_list"] = codes_list
+            return example
 
-    # Process dataset: tokenize audio
-    print("Tokenizing audio...")
-    ds = ds.map(add_codes, remove_columns=["audio"])
+        print("Tokenizing audio...")
+        ds = ds.map(add_codes, remove_columns=["audio"])
+    else:
+        # Multi-GPU path: shard dataset across GPUs
+        shards = [ds.shard(num_shards=num_gpus, index=i) for i in range(num_gpus)]
+
+        manager = mp.Manager()
+        return_dict = manager.dict()
+
+        mp.set_start_method("spawn", force=True)
+        processes = []
+        for rank in range(num_gpus):
+            p = mp.Process(
+                target=_encode_shard,
+                args=(rank, num_gpus, shards[rank], codec_type, codec_model_name,
+                      ds_sample_rate, target_sample_rate, AUDIO_TOKENS_START, return_dict),
+            )
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+        # Merge shards back (in order)
+        encoded_shards = [return_dict[rank] for rank in range(num_gpus)]
+        ds = concatenate_datasets(encoded_shards)
+
+        # Get codes_per_group from a temporary codec (CPU, lightweight)
+        _codec = load_codec(codec_type=codec_type, model_name=codec_model_name, device="cpu")
+        codes_per_group = _codec.codes_per_group
+        del _codec
 
     # Load text tokenizer
     print(f"Loading tokenizer: {tokenizer_model}")
@@ -208,7 +273,7 @@ def process_dataset(
     # Remove duplicate frames
     def remove_duplicate_frames_wrapper(example):
         """Wrapper for remove_duplicate_frames."""
-        example["codes_list"] = remove_duplicate_frames(example["codes_list"])
+        example["codes_list"] = remove_duplicate_frames(example["codes_list"], codes_per_group)
         return example
 
     print("Removing duplicate frames...")

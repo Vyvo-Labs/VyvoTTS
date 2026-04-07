@@ -8,7 +8,7 @@ from vyvotts.inference.base import BaseVyvoTTSInference
 class VyvoTTSUnslothInference(BaseVyvoTTSInference):
     """Memory-efficient TTS inference engine using Unsloth backend.
 
-    Supports 4-bit and 8-bit quantization. Keeps SNAC model on CPU
+    Supports 4-bit and 8-bit quantization. Keeps codec model on CPU
     to minimize GPU memory usage.
     """
 
@@ -17,7 +17,9 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-v2-Neuvillette",
-        snac_model_name: str = "hubertsiuzdak/snac_24khz",
+        tokenizer_name: Optional[str] = None,
+        codec_type: str = "snac",
+        codec_model_name: str = None,
         max_seq_length: int = 8192,
         load_in_4bit: bool = False,
         load_in_8bit: bool = False,
@@ -33,8 +35,8 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
         )
         FastLanguageModel.for_inference(self.model)
 
-        # SNAC on CPU to save GPU memory
-        self.snac_model = self._load_snac_model(snac_model_name, device="cpu")
+        # Codec on CPU to save GPU memory
+        self.codec = self._load_codec(codec_type, codec_model_name, device="cpu")
 
     def generate(
         self,
@@ -79,7 +81,7 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
                 use_cache=True,
             )
 
-        # Decode on CPU (where SNAC model lives)
+        # Decode on CPU (where codec model lives)
         audio_samples = self._extract_audio_from_tokens(generated_ids, device="cpu")
         audio = audio_samples[0] if audio_samples else None
 

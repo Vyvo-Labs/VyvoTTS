@@ -14,7 +14,9 @@ class VyvoTTSSGLangInference(BaseVyvoTTSInference):
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
-        snac_model_name: str = "hubertsiuzdak/snac_24khz",
+        tokenizer_name: Optional[str] = None,
+        codec_type: str = "snac",
+        codec_model_name: str = None,
         context_length: int = 2048,
         mem_fraction_static: float = 0.90,
         **engine_kwargs,
@@ -28,8 +30,8 @@ class VyvoTTSSGLangInference(BaseVyvoTTSInference):
             attention_backend="triton",
             **engine_kwargs,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.snac_model = self._load_snac_model(snac_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name or model_name)
+        self.codec = self._load_codec(codec_type, codec_model_name)
 
     def generate(
         self,

@@ -3,7 +3,8 @@ import torch
 import soundfile as sf
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from snac import SNAC
+
+from vyvotts.codec import load_codec, BaseCodec
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -15,11 +16,10 @@ def load_config(config_path: str) -> Dict[str, Any]:
 class BaseVyvoTTSInference:
     """Base class for all VyvoTTS inference engines.
 
-    Handles config loading, token constants, SNAC audio decoding,
+    Handles config loading, token constants, audio codec decoding,
     and audio file saving. Subclasses implement model loading and generation.
     """
 
-    CODES_PER_GROUP = 7
     SAMPLE_RATE = 24000
     DEFAULT_CONFIG_PATH = "vyvotts/configs/inference/qwen3.yaml"
 
@@ -52,33 +52,41 @@ class BaseVyvoTTSInference:
         self.PAD_TOKEN = c['PAD_TOKEN']
         self.AUDIO_TOKENS_START = c['AUDIO_TOKENS_START']
 
-    def _load_snac_model(
+    def _load_codec(
         self,
-        snac_model_name: str = "hubertsiuzdak/snac_24khz",
+        codec_type: str = "snac",
+        codec_model_name: str = None,
         device: str = "cpu",
         optimize: bool = False,
-    ) -> SNAC:
-        """Load SNAC audio codec model.
+        **kwargs,
+    ) -> BaseCodec:
+        """Load audio codec model.
 
         Args:
-            snac_model_name: HuggingFace model ID or local path.
+            codec_type: Codec type — "snac" or "mimi".
+            codec_model_name: HuggingFace model ID or local path.
             device: Target device.
-            optimize: If True, apply fast-snac FP16 Triton optimizations.
+            optimize: (SNAC only) Apply fast-snac FP16 Triton optimizations.
         """
-        model = SNAC.from_pretrained(snac_model_name)
-        model = model.to(device)
+        num_codebooks = self.config.get("NUM_CODEBOOKS")
+        if num_codebooks is not None:
+            kwargs["num_codebooks"] = num_codebooks
 
-        if optimize and device != "cpu":
-            from snac.optimize import optimize_snac_triton
-            # Generate sample codes for warmup
-            sample_audio = torch.randn(1, 1, self.SAMPLE_RATE, device=device)
-            with torch.no_grad():
-                sample_codes = model.encode(sample_audio)
-            self._optimized_decode = optimize_snac_triton(
-                model, sample_codes, dtype="fp16", use_compile=True,
-            )
+        return load_codec(
+            codec_type=codec_type,
+            model_name=codec_model_name,
+            device=device,
+            optimize=optimize,
+            **kwargs,
+        )
 
-        return model
+    # Speaker IDs seen during training — used as fallback when no voice is specified
+    DEFAULT_SPEAKERS = [
+        "EN_B00000_S00000", "EN_B00000_S00010", "EN_B00000_S00020",
+        "EN_B00000_S00030", "EN_B00000_S00040", "EN_B00000_S00050",
+        "EN_B00000_S00060", "EN_B00000_S00070", "EN_B00000_S00080",
+        "EN_B00000_S00090", "EN_B00000_S00100", "EN_B00000_S00110",
+    ]
 
     def _build_prompt_tokens(
         self,
@@ -87,10 +95,15 @@ class BaseVyvoTTSInference:
     ) -> torch.Tensor:
         """Tokenize text and wrap with special tokens.
 
+        If no voice is provided, a random speaker ID from training data is used.
+
         Returns:
             Token IDs tensor of shape (1, seq_len).
         """
-        prompt = f"{voice}: {text}" if voice else text
+        import random
+        if voice is None:
+            voice = random.choice(self.DEFAULT_SPEAKERS)
+        prompt = f"{voice}: {text}"
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
 
         start = torch.tensor([[self.START_OF_HUMAN]], dtype=torch.int64)
@@ -128,49 +141,6 @@ class BaseVyvoTTSInference:
             torch.cat(masks, dim=0).to(device),
         )
 
-    def _redistribute_codes(
-        self,
-        code_list: List[int],
-        device: str = "cpu",
-    ) -> Optional[torch.Tensor]:
-        """De-interleave flat audio codes into 3 SNAC layers and decode to audio.
-
-        SNAC uses 3 hierarchical codebook levels. Each audio frame produces 7
-        interleaved codes with per-level offsets of n*4096:
-            [L0, L1a+4096, L2a+2*4096, L2b+3*4096, L1b+4*4096, L2c+5*4096, L2d+6*4096]
-
-        This method reverses the interleaving using vectorized tensor operations.
-        """
-        num_groups = len(code_list) // self.CODES_PER_GROUP
-        if num_groups == 0:
-            return None
-
-        codes = torch.tensor(
-            code_list[:num_groups * self.CODES_PER_GROUP]
-        ).view(num_groups, self.CODES_PER_GROUP)
-
-        layer_0 = codes[:, 0]
-        layer_1 = torch.stack([
-            codes[:, 1] - 4096,
-            codes[:, 4] - 4 * 4096,
-        ], dim=1).reshape(-1)
-        layer_2 = torch.stack([
-            codes[:, 2] - 2 * 4096,
-            codes[:, 3] - 3 * 4096,
-            codes[:, 5] - 5 * 4096,
-            codes[:, 6] - 6 * 4096,
-        ], dim=1).reshape(-1)
-
-        # Clamp to valid codebook range (0-4095)
-        layer_0 = layer_0.clamp(0, 4095)
-        layer_1 = layer_1.clamp(0, 4095)
-        layer_2 = layer_2.clamp(0, 4095)
-
-        snac_codes = [layer.unsqueeze(0).to(device) for layer in (layer_0, layer_1, layer_2)]
-        if hasattr(self, '_optimized_decode'):
-            return self._optimized_decode(snac_codes)
-        return self.snac_model.decode(snac_codes)
-
     def _extract_audio_from_tokens(
         self,
         generated_ids: torch.Tensor,
@@ -179,8 +149,10 @@ class BaseVyvoTTSInference:
         """Extract audio tokens from generated IDs and decode to waveforms.
 
         Finds the last START_OF_SPEECH marker, extracts everything after it,
-        removes END_OF_SPEECH markers, and decodes via SNAC.
+        removes END_OF_SPEECH markers, and decodes via the audio codec.
         """
+        codes_per_group = self.codec.codes_per_group
+
         # Crop to content after last START_OF_SPEECH
         indices = (generated_ids == self.START_OF_SPEECH).nonzero(as_tuple=True)
         if len(indices[1]) > 0:
@@ -193,16 +165,22 @@ class BaseVyvoTTSInference:
         for row in cropped:
             row = row[row != self.END_OF_SPEECH]
 
-            # Trim to complete frames (multiple of CODES_PER_GROUP)
-            n = (row.size(0) // self.CODES_PER_GROUP) * self.CODES_PER_GROUP
+            # Trim to complete frames (multiple of codes_per_group)
+            n = (row.size(0) // codes_per_group) * codes_per_group
             if n == 0:
                 continue
 
             # Vectorized offset subtraction
             code_list = (row[:n] - self.AUDIO_TOKENS_START).tolist()
 
-            audio = self._redistribute_codes(code_list, device=device)
+            audio = self.codec.decode(code_list, device=device)
             if audio is not None:
+                # Apply fade-out to avoid click/artifact at the end
+                audio = audio.clone()
+                fade_samples = min(int(0.05 * self.SAMPLE_RATE), audio.shape[-1])  # 50ms
+                if fade_samples > 0:
+                    fade = torch.linspace(1.0, 0.0, fade_samples, device=audio.device)
+                    audio[..., -fade_samples:] *= fade
                 audio_samples.append(audio)
 
         return audio_samples
