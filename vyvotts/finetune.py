@@ -58,7 +58,10 @@ def _load_yaml(path: str) -> dict:
 # ---------------------------------------------------------------------------
 # Step 1 — Tokenize
 # ---------------------------------------------------------------------------
-def _tokenize_worker(rank, parquet_files, speaker, config, codec_type, tokenizer_name, return_dict):
+def _tokenize_worker(
+    rank, parquet_files, speaker, config, codec_type, tokenizer_name,
+    return_dict, deduplicate_frames=False, completion_only_loss=True,
+):
     """Worker: tokenize a shard of parquet files on a specific GPU."""
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
@@ -75,6 +78,7 @@ def _tokenize_worker(rank, parquet_files, speaker, config, codec_type, tokenizer
     EOT = config["END_OF_TEXT"]
 
     all_ids, all_labels, all_masks = [], [], []
+    all_texts, all_speakers, all_durations = [], [], []
     total, skipped = 0, 0
 
     for pf in parquet_files:
@@ -98,7 +102,7 @@ def _tokenize_worker(rank, parquet_files, speaker, config, codec_type, tokenizer
 
                 arr, sr = sf.read(io.BytesIO(audio_bytes))
                 if arr.ndim > 1:
-                    arr = arr[:, 0]
+                    arr = arr.mean(axis=1)
 
                 wav = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
                 if sr != 24000:
@@ -107,7 +111,8 @@ def _tokenize_worker(rank, parquet_files, speaker, config, codec_type, tokenizer
 
                 codes = codec.encode(wav)
                 codes = [c + ATS for c in codes]
-                codes = remove_duplicate_frames(codes, cpg)
+                if deduplicate_frames:
+                    codes = remove_duplicate_frames(codes, cpg)
 
                 row_speaker = speaker_col[i].as_py() if has_speaker_col else speaker
                 text_ids = tokenizer.encode(f"{row_speaker}: {text.strip()}", add_special_tokens=True)
@@ -121,8 +126,17 @@ def _tokenize_worker(rank, parquet_files, speaker, config, codec_type, tokenizer
                 )
 
                 all_ids.append(seq)
-                all_labels.append(seq)
+                if completion_only_loss:
+                    prompt_length = 1 + len(text_ids) + 1
+                    all_labels.append(
+                        [-100] * prompt_length + seq[prompt_length:]
+                    )
+                else:
+                    all_labels.append(seq)
                 all_masks.append([1] * len(seq))
+                all_texts.append(text.strip())
+                all_speakers.append(row_speaker)
+                all_durations.append(float(wav.shape[-1] / 24000))
                 total += 1
 
                 if total % 500 == 0:
@@ -132,7 +146,10 @@ def _tokenize_worker(rank, parquet_files, speaker, config, codec_type, tokenizer
                 skipped += 1
 
     print(f"  [GPU {rank}] Done: {total} samples (skipped {skipped})", flush=True)
-    return_dict[rank] = (all_ids, all_labels, all_masks)
+    return_dict[rank] = (
+        all_ids, all_labels, all_masks, all_texts, all_speakers,
+        all_durations,
+    )
 
     del codec
     torch.cuda.empty_cache()
@@ -146,6 +163,8 @@ def tokenize(
     codec_type: str = DEFAULT_CODEC,
     tokenizer_name: str = DEFAULT_TOKENIZER,
     num_gpus: int = None,
+    deduplicate_frames: bool = False,
+    completion_only_loss: bool = True,
 ) -> str:
     """Encode audio with codec and build training sequences using multiple GPUs."""
     import torch.multiprocessing as mp
@@ -156,6 +175,8 @@ def tokenize(
 
     num_gpus = num_gpus or torch.cuda.device_count()
     num_gpus = min(num_gpus, torch.cuda.device_count())
+    if num_gpus < 1:
+        raise RuntimeError("Tokenization requires at least one CUDA GPU")
     print(f"  Using {num_gpus} GPU(s) for tokenization")
 
     print(f"  Downloading {dataset_repo}...")
@@ -167,8 +188,14 @@ def tokenize(
         # Single GPU — run in-process
         manager = mp.Manager()
         return_dict = manager.dict()
-        _tokenize_worker(0, parquet_files, speaker, config, codec_type, tokenizer_name, return_dict)
-        all_ids, all_labels, all_masks = return_dict[0]
+        _tokenize_worker(
+            0, parquet_files, speaker, config, codec_type, tokenizer_name,
+            return_dict, deduplicate_frames, completion_only_loss,
+        )
+        (
+            all_ids, all_labels, all_masks, all_texts, all_speakers,
+            all_durations,
+        ) = return_dict[0]
     else:
         # Multi-GPU — shard parquet files across GPUs
         shards = [[] for _ in range(num_gpus)]
@@ -187,7 +214,11 @@ def tokenize(
         for rank in range(num_gpus):
             p = mp.Process(
                 target=_tokenize_worker,
-                args=(rank, shards[rank], speaker, config, codec_type, tokenizer_name, return_dict),
+                args=(
+                    rank, shards[rank], speaker, config, codec_type,
+                    tokenizer_name, return_dict, deduplicate_frames,
+                    completion_only_loss,
+                ),
             )
             p.start()
             processes.append(p)
@@ -197,15 +228,26 @@ def tokenize(
 
         # Merge results from all GPUs
         all_ids, all_labels, all_masks = [], [], []
+        all_texts, all_speakers, all_durations = [], [], []
         for rank in range(num_gpus):
-            ids, labels, masks = return_dict[rank]
+            ids, labels, masks, texts, speakers, durations = return_dict[rank]
             all_ids.extend(ids)
             all_labels.extend(labels)
             all_masks.extend(masks)
+            all_texts.extend(texts)
+            all_speakers.extend(speakers)
+            all_durations.extend(durations)
 
     print(f"  Total tokenized: {len(all_ids)} samples")
 
-    ds = Dataset.from_dict({"input_ids": all_ids, "labels": all_labels, "attention_mask": all_masks})
+    ds = Dataset.from_dict({
+        "input_ids": all_ids,
+        "labels": all_labels,
+        "attention_mask": all_masks,
+        "reference_text": all_texts,
+        "speaker_id": all_speakers,
+        "duration": all_durations,
+    })
     ds.save_to_disk(tokenized_path)
 
     return tokenized_path
@@ -374,6 +416,14 @@ def main():
     parser.add_argument("--work_dir", default="/scratch/kadirnar")
     parser.add_argument("--skip_tokenize", action="store_true")
     parser.add_argument("--skip_train", action="store_true")
+    parser.add_argument(
+        "--deduplicate_frames", action="store_true",
+        help="Apply legacy lossy frame compression (not recommended)",
+    )
+    parser.add_argument(
+        "--full_sequence_loss", action="store_true",
+        help="Also supervise prompt tokens instead of speech completion only",
+    )
     args = parser.parse_args()
 
     assert len(args.dataset) == len(args.speaker), "--dataset and --speaker must have same count"
@@ -395,7 +445,11 @@ def main():
 
         if not args.skip_tokenize:
             print(f"\n[1/3] Tokenize")
-            tokenize(dataset_repo, speaker, tokenized_path, config, args.codec, args.tokenizer, args.num_gpus)
+            tokenize(
+                dataset_repo, speaker, tokenized_path, config, args.codec,
+                args.tokenizer, args.num_gpus, args.deduplicate_frames,
+                not args.full_sequence_loss,
+            )
 
         if not args.skip_train:
             print(f"\n[2/3] Finetune")

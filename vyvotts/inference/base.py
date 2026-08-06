@@ -5,6 +5,11 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from vyvotts.codec import load_codec, BaseCodec
+from vyvotts.inference.constraints import (
+    AudioTokenLogitsProcessor,
+    AudioTokenSequenceError,
+    extract_audio_codes,
+)
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -21,7 +26,7 @@ class BaseVyvoTTSInference:
     """
 
     SAMPLE_RATE = 24000
-    DEFAULT_CONFIG_PATH = "vyvotts/configs/inference/qwen3.yaml"
+    DEFAULT_CONFIG_PATH = "vyvotts/configs/inference/lfm2.yaml"
 
     def __init__(
         self,
@@ -54,7 +59,7 @@ class BaseVyvoTTSInference:
 
     def _load_codec(
         self,
-        codec_type: str = "snac",
+        codec_type: Optional[str] = None,
         codec_model_name: str = None,
         device: str = "cpu",
         optimize: bool = False,
@@ -68,6 +73,8 @@ class BaseVyvoTTSInference:
             device: Target device.
             optimize: (SNAC only) Apply fast-snac FP16 Triton optimizations.
         """
+        codec_type = codec_type or self.config.get("CODEC_TYPE", "snac")
+        codec_model_name = codec_model_name or self.config.get("CODEC_MODEL")
         num_codebooks = self.config.get("NUM_CODEBOOKS")
         if num_codebooks is not None:
             kwargs["num_codebooks"] = num_codebooks
@@ -80,7 +87,8 @@ class BaseVyvoTTSInference:
             **kwargs,
         )
 
-    # Speaker IDs seen during training — used as fallback when no voice is specified
+    # Speaker IDs seen during training. Random selection is opt-in because a
+    # speaker prefix is not present in single-speaker training examples.
     DEFAULT_SPEAKERS = [
         "EN_B00000_S00000", "EN_B00000_S00010", "EN_B00000_S00020",
         "EN_B00000_S00030", "EN_B00000_S00040", "EN_B00000_S00050",
@@ -92,18 +100,21 @@ class BaseVyvoTTSInference:
         self,
         text: str,
         voice: Optional[str] = None,
+        use_random_voice: bool = False,
     ) -> torch.Tensor:
         """Tokenize text and wrap with special tokens.
 
-        If no voice is provided, a random speaker ID from training data is used.
+        A speaker prefix is included only when ``voice`` is supplied or random
+        speaker selection is explicitly requested.
 
         Returns:
             Token IDs tensor of shape (1, seq_len).
         """
-        import random
-        if voice is None:
+        if voice is None and use_random_voice:
+            import random
+
             voice = random.choice(self.DEFAULT_SPEAKERS)
-        prompt = f"{voice}: {text}"
+        prompt = f"{voice}: {text}" if voice is not None else text
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
 
         start = torch.tensor([[self.START_OF_HUMAN]], dtype=torch.int64)
@@ -141,47 +152,63 @@ class BaseVyvoTTSInference:
             torch.cat(masks, dim=0).to(device),
         )
 
+    def _audio_logits_processor(
+        self,
+        prompt_length: int,
+        min_audio_frames: int = 1,
+    ) -> AudioTokenLogitsProcessor:
+        """Build the codec-aware generation grammar for this engine."""
+        return AudioTokenLogitsProcessor(
+            prompt_length=prompt_length,
+            start_of_ai=self.START_OF_AI,
+            start_of_speech=self.START_OF_SPEECH,
+            end_of_speech=self.END_OF_SPEECH,
+            audio_tokens_start=self.AUDIO_TOKENS_START,
+            codes_per_group=self.codec.codes_per_group,
+            codebook_size=self.codec.codebook_size,
+            pad_token_id=self.PAD_TOKEN,
+            min_audio_frames=min_audio_frames,
+        )
+
     def _extract_audio_from_tokens(
         self,
         generated_ids: torch.Tensor,
         device: str = "cpu",
-    ) -> List[torch.Tensor]:
+    ) -> List[Optional[torch.Tensor]]:
         """Extract audio tokens from generated IDs and decode to waveforms.
 
-        Finds the last START_OF_SPEECH marker, extracts everything after it,
-        removes END_OF_SPEECH markers, and decodes via the audio codec.
+        Each row is parsed independently. A malformed row yields ``None`` at
+        the same batch index; tokens are never clamped or frame-trimmed here.
         """
-        codes_per_group = self.codec.codes_per_group
+        if generated_ids.ndim == 1:
+            generated_ids = generated_ids.unsqueeze(0)
+        if generated_ids.ndim != 2:
+            raise ValueError("generated_ids must be a rank-1 or rank-2 tensor")
 
-        # Crop to content after last START_OF_SPEECH
-        indices = (generated_ids == self.START_OF_SPEECH).nonzero(as_tuple=True)
-        if len(indices[1]) > 0:
-            last_idx = indices[1][-1].item()
-            cropped = generated_ids[:, last_idx + 1:]
-        else:
-            cropped = generated_ids
-
-        audio_samples = []
-        for row in cropped:
-            row = row[row != self.END_OF_SPEECH]
-
-            # Trim to complete frames (multiple of codes_per_group)
-            n = (row.size(0) // codes_per_group) * codes_per_group
-            if n == 0:
+        audio_samples: List[Optional[torch.Tensor]] = []
+        for row in generated_ids:
+            try:
+                code_list = extract_audio_codes(
+                    row,
+                    start_of_speech=self.START_OF_SPEECH,
+                    end_of_speech=self.END_OF_SPEECH,
+                    audio_tokens_start=self.AUDIO_TOKENS_START,
+                    codes_per_group=self.codec.codes_per_group,
+                    codebook_size=self.codec.codebook_size,
+                )
+            except AudioTokenSequenceError:
+                audio_samples.append(None)
                 continue
-
-            # Vectorized offset subtraction
-            code_list = (row[:n] - self.AUDIO_TOKENS_START).tolist()
 
             audio = self.codec.decode(code_list, device=device)
             if audio is not None:
                 # Apply fade-out to avoid click/artifact at the end
                 audio = audio.clone()
-                fade_samples = min(int(0.05 * self.SAMPLE_RATE), audio.shape[-1])  # 50ms
+                fade_samples = min(int(0.05 * self.codec.sample_rate), audio.shape[-1])
                 if fade_samples > 0:
                     fade = torch.linspace(1.0, 0.0, fade_samples, device=audio.device)
                     audio[..., -fade_samples:] *= fade
-                audio_samples.append(audio)
+            audio_samples.append(audio)
 
         return audio_samples
 

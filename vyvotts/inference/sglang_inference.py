@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any
 from transformers import AutoTokenizer
 
 from vyvotts.inference.base import BaseVyvoTTSInference
+from vyvotts.inference.constraints import include_end_token_for_stop
 
 
 class VyvoTTSSGLangInference(BaseVyvoTTSInference):
@@ -15,7 +16,7 @@ class VyvoTTSSGLangInference(BaseVyvoTTSInference):
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
         tokenizer_name: Optional[str] = None,
-        codec_type: str = "snac",
+        codec_type: Optional[str] = None,
         codec_model_name: str = None,
         context_length: int = 2048,
         mem_fraction_static: float = 0.90,
@@ -73,7 +74,11 @@ class VyvoTTSSGLangInference(BaseVyvoTTSInference):
             input_ids=[input_ids_list],
             sampling_params=sampling_params,
         )
-        token_ids = outputs[0]["output_ids"]
+        result = outputs[0]
+        finish_reason = result.get("meta_info", {}).get("finish_reason")
+        token_ids = include_end_token_for_stop(
+            result["output_ids"], self.END_OF_SPEECH, finish_reason
+        )
         generated_ids = torch.tensor([token_ids], dtype=torch.long)
 
         audio_samples = self._extract_audio_from_tokens(generated_ids)

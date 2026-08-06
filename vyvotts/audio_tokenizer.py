@@ -7,6 +7,7 @@ from datasets import load_dataset, concatenate_datasets
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
+from vyvotts.audio_utils import decode_audio_value
 from vyvotts.codec import load_codec
 
 
@@ -40,10 +41,20 @@ def tokenise_audio(waveform, codec, ds_sample_rate, target_sample_rate, audio_to
         List of audio token IDs with proper offsets applied
     """
     # Convert to tensor and prepare for processing
-    import numpy as np
-    if not isinstance(waveform, np.ndarray):
-        waveform = np.array(waveform, dtype=np.float32)
-    waveform = torch.from_numpy(waveform).unsqueeze(0)
+    if isinstance(waveform, torch.Tensor):
+        waveform = waveform.detach().float().cpu()
+    else:
+        import numpy as np
+
+        waveform = torch.from_numpy(np.asarray(waveform, dtype=np.float32))
+    if waveform.ndim == 2:
+        # Hugging Face audio arrays may be [channels, samples] or
+        # [samples, channels]. Average the smaller dimension as channels.
+        channel_dim = 0 if waveform.shape[0] <= waveform.shape[1] else 1
+        waveform = waveform.mean(dim=channel_dim)
+    if waveform.ndim != 1:
+        raise ValueError(f"Expected mono audio, got shape {tuple(waveform.shape)}")
+    waveform = waveform.unsqueeze(0)
     waveform = waveform.to(dtype=torch.float32)
 
     # Resample to target sample rate if needed
@@ -63,7 +74,9 @@ def remove_duplicate_frames(codes_list, codes_per_group):
     Remove consecutive duplicate audio frames to reduce redundancy.
 
     Each frame consists of codes_per_group codes.
-    Frames with identical first codes are considered duplicates.
+    This lossy compression is retained only for compatibility with older
+    experiments. New datasets should keep every frame because repeated codec
+    frames carry duration, prosody, and fine acoustic detail.
 
     Args:
         codes_list: List of audio codes
@@ -75,17 +88,22 @@ def remove_duplicate_frames(codes_list, codes_per_group):
     if len(codes_list) % codes_per_group != 0:
         raise ValueError(f"Input list length must be divisible by {codes_per_group}")
 
+    if not codes_list:
+        return []
+
     # Keep first frame
     result = codes_list[:codes_per_group]
     removed_frames = 0
 
     # Check each subsequent frame
     for i in range(codes_per_group, len(codes_list), codes_per_group):
-        current_first_code = codes_list[i]
-        previous_first_code = result[-codes_per_group]
+        current_frame = codes_list[i:i + codes_per_group]
+        previous_frame = result[-codes_per_group:]
 
-        if current_first_code != previous_first_code:
-            result.extend(codes_list[i:i + codes_per_group])
+        # Comparing the complete frame avoids dropping differing fine
+        # codebooks solely because the coarse codebook happened to repeat.
+        if current_frame != previous_frame:
+            result.extend(current_frame)
         else:
             removed_frames += 1
 
@@ -115,10 +133,16 @@ def _encode_shard(rank, num_gpus, dataset_shard, codec_type, codec_model_name,
         codes_list = None
         try:
             audio_data = example.get("audio")
-            if audio_data and "array" in audio_data:
+            if audio_data is not None:
+                waveform, sample_rate = decode_audio_value(
+                    audio_data, default_sample_rate=ds_sample_rate
+                )
                 codes_list = tokenise_audio(
-                    audio_data["array"], codec,
-                    ds_sample_rate, target_sample_rate, audio_tokens_start,
+                    waveform,
+                    codec,
+                    sample_rate,
+                    target_sample_rate,
+                    audio_tokens_start,
                 )
         except Exception as e:
             print(f"[GPU {rank}] Skipping row: {e}")
@@ -140,6 +164,8 @@ def process_dataset(
     text_field="text_scribe",
     target_sample_rate=24000,
     num_gpus=None,
+    deduplicate_frames=False,
+    completion_only_loss=True,
 ):
     """
     Process dataset: tokenize audio and text, create training sequences.
@@ -155,6 +181,10 @@ def process_dataset(
         text_field: Name of text field in dataset (default: "text_scribe")
         target_sample_rate: Target audio sample rate (default: 24000)
         num_gpus: Number of GPUs to use (default: all available)
+        deduplicate_frames: Apply legacy lossy frame compression. Disabled by
+            default because it changes timing and can reduce speech quality.
+        completion_only_loss: Mask the text prompt in labels so causal loss is
+            applied only to the assistant/speech completion.
     """
     # Set tokenizer and config based on model type
     if model_type == "qwen3":
@@ -197,8 +227,6 @@ def process_dataset(
     # Load dataset
     print("Loading dataset...")
     ds = load_dataset(original_dataset, split="train")
-    ds_sample_rate = ds[0]["audio"]["sampling_rate"]
-
     # Determine number of GPUs
     available_gpus = torch.cuda.device_count()
     if num_gpus is None:
@@ -218,10 +246,16 @@ def process_dataset(
             codes_list = None
             try:
                 audio_data = example.get("audio")
-                if audio_data and "array" in audio_data:
+                if audio_data is not None:
+                    waveform, sample_rate = decode_audio_value(
+                        audio_data, default_sample_rate=target_sample_rate
+                    )
                     codes_list = tokenise_audio(
-                        audio_data["array"], codec,
-                        ds_sample_rate, target_sample_rate, AUDIO_TOKENS_START,
+                        waveform,
+                        codec,
+                        sample_rate,
+                        target_sample_rate,
+                        AUDIO_TOKENS_START,
                     )
             except Exception as e:
                 print(f"Skipping row due to error: {e}")
@@ -243,7 +277,7 @@ def process_dataset(
             p = mp.Process(
                 target=_encode_shard,
                 args=(rank, num_gpus, shards[rank], codec_type, codec_model_name,
-                      ds_sample_rate, target_sample_rate, AUDIO_TOKENS_START, return_dict),
+                      target_sample_rate, target_sample_rate, AUDIO_TOKENS_START, return_dict),
             )
             p.start()
             processes.append(p)
@@ -263,7 +297,7 @@ def process_dataset(
     # Load text tokenizer
     print(f"Loading tokenizer: {tokenizer_model}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
-    num_proc = os.cpu_count() - 2
+    num_proc = max(1, (os.cpu_count() or 1) - 2)
 
     # Filter out failed tokenizations
     print("Filtering invalid examples...")
@@ -276,8 +310,9 @@ def process_dataset(
         example["codes_list"] = remove_duplicate_frames(example["codes_list"], codes_per_group)
         return example
 
-    print("Removing duplicate frames...")
-    ds = ds.map(remove_duplicate_frames_wrapper, num_proc=num_proc)
+    if deduplicate_frames:
+        print("WARNING: applying legacy lossy duplicate-frame compression")
+        ds = ds.map(remove_duplicate_frames_wrapper, num_proc=num_proc)
 
     print(f"""
 NOTE: Text prompt customization
@@ -299,6 +334,9 @@ For multispeaker models, ensure your dataset has a "source" field.
         else:
             text_prompt = example[text_field]
 
+        example["reference_text"] = example[text_field].strip()
+        example["speaker_id"] = example.get("source", "")
+
         # Tokenize text input
         text_ids = tokenizer.encode(text_prompt, add_special_tokens=True)
         text_ids.append(END_OF_TEXT)
@@ -317,7 +355,13 @@ For multispeaker models, ensure your dataset has a "source" field.
         )
 
         example["input_ids"] = input_ids
-        example["labels"] = input_ids
+        if completion_only_loss:
+            # Supervise START_OF_AI and everything after it. Prompt tokens are
+            # context, not prediction targets for TTS fine-tuning.
+            prompt_length = 1 + len(example["text_tokens"]) + 1
+            example["labels"] = [-100] * prompt_length + input_ids[prompt_length:]
+        else:
+            example["labels"] = input_ids
         example["attention_mask"] = [1] * len(input_ids)
 
         return example
@@ -331,7 +375,10 @@ For multispeaker models, ensure your dataset has a "source" field.
     )
 
     # Keep only training columns
-    columns_to_keep = ["input_ids", "labels", "attention_mask"]
+    columns_to_keep = [
+        "input_ids", "labels", "attention_mask", "reference_text",
+        "speaker_id", "duration", "dnsmos",
+    ]
     columns_to_remove = [col for col in ds.column_names if col not in columns_to_keep]
     ds = ds.remove_columns(columns_to_remove)
 

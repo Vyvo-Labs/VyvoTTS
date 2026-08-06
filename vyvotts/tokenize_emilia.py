@@ -27,13 +27,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
 import tarfile
+import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
@@ -45,10 +46,165 @@ from huggingface_hub import snapshot_download
 
 from vyvotts.codec import load_codec
 
+_CACHE_SCHEMA_VERSION = 1
+_CACHE_MANIFEST_NAME = "manifest.json"
+_CACHE_SHARDS_DIR = "shards"
+_DEFAULT_CODEC_MODELS = {
+    "mimi": "kyutai/mimi",
+    "snac": "hubertsiuzdak/snac_24khz",
+}
+
 
 def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
+
+
+def resolve_codec_model_name(codec_type: str, codec_model_name: str | None) -> str:
+    """Return the exact codec checkpoint used for tokenization."""
+    if codec_model_name:
+        return codec_model_name
+    try:
+        return _DEFAULT_CODEC_MODELS[codec_type]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported codec type: {codec_type!r}") from exc
+
+
+def source_shard_identity(shard_path: str | Path) -> dict[str, int | str]:
+    """Build a stable local identity for a source shard.
+
+    The resolved path distinguishes equal stems from different locations. Size and
+    modification time ensure replacing a local shard selects a new cache namespace.
+    Hugging Face snapshot symlinks resolve to their content-addressed blob paths.
+    """
+    path = Path(shard_path).expanduser().resolve(strict=True)
+    stat = path.stat()
+    return {
+        "path": path.as_posix(),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def make_cache_manifest(
+    shard_files: list[str],
+    *,
+    shard_type: str,
+    dataset: str,
+    subsets: list[str],
+    model_type: str,
+    codec_type: str,
+    codec_model_name: str,
+    audio_tokens_start: int,
+    target_sample_rate: int,
+) -> dict:
+    """Describe every input that can change intermediate audio tokens."""
+    source_shards = sorted(
+        (source_shard_identity(path) for path in shard_files),
+        key=lambda item: str(item["path"]),
+    )
+    return {
+        "schema_version": _CACHE_SCHEMA_VERSION,
+        "dataset_inputs": {
+            "dataset": dataset,
+            "subsets": sorted(set(subsets)),
+            "shard_type": shard_type,
+            "source_shards": source_shards,
+        },
+        "model_inputs": {
+            "model_type": model_type,
+            "codec_type": codec_type,
+            "codec_model_name": codec_model_name,
+            "audio_tokens_start": int(audio_tokens_start),
+            "target_sample_rate": int(target_sample_rate),
+        },
+    }
+
+
+def cache_fingerprint(manifest: dict) -> str:
+    """Hash a cache manifest using canonical JSON serialization."""
+    payload = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _atomic_write_json(value: dict, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary_file:
+            json.dump(value, temporary_file, ensure_ascii=False, indent=2, sort_keys=True)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_name, destination)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def prepare_cache_namespace(work_dir: str | Path, manifest: dict) -> Path:
+    """Create or validate the namespace selected by ``manifest``."""
+    fingerprint = cache_fingerprint(manifest)
+    namespace = Path(work_dir) / f"tokenized-v{_CACHE_SCHEMA_VERSION}-{fingerprint}"
+    manifest_path = namespace / _CACHE_MANIFEST_NAME
+    namespace.mkdir(parents=True, exist_ok=True)
+
+    expected_manifest = {**manifest, "fingerprint": fingerprint}
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as manifest_file:
+            cached_manifest = json.load(manifest_file)
+        if cached_manifest != expected_manifest:
+            raise RuntimeError(
+                f"Cache manifest mismatch in namespace {namespace}. "
+                "Remove that namespace before rebuilding it."
+            )
+    else:
+        _atomic_write_json(expected_manifest, manifest_path)
+
+    (namespace / _CACHE_SHARDS_DIR).mkdir(parents=True, exist_ok=True)
+    return namespace
+
+
+def cache_shard_filename(shard_path: str | Path) -> str:
+    """Return a collision-resistant, rank-independent output filename."""
+    identity = source_shard_identity(shard_path)
+    identity_hash = cache_fingerprint(identity)[:20]
+    return f"{Path(shard_path).stem}-{identity_hash}.pt"
+
+
+def cache_shard_files(cache_namespace: str | Path) -> list[Path]:
+    """List only completed shard outputs from one selected namespace."""
+    return sorted((Path(cache_namespace) / _CACHE_SHARDS_DIR).glob("*.pt"))
+
+
+def atomic_torch_save(value, destination: str | Path) -> None:
+    """Atomically publish a PyTorch cache file after serialization succeeds."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    try:
+        torch.save(value, temporary_name)
+        os.replace(temporary_name, destination)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +258,7 @@ def process_single_parquet(
 
             audio_array, sr = sf.read(io.BytesIO(audio_bytes))
             if len(audio_array.shape) > 1:
-                audio_array = audio_array[:, 0]  # mono
+                audio_array = audio_array.mean(axis=1)  # mono
 
             # Resample if needed
             waveform = torch.from_numpy(audio_array.astype(np.float32)).unsqueeze(0)
@@ -176,7 +332,7 @@ def process_single_tar(
                 audio_array, sr = sf.read(io.BytesIO(audio_bytes))
 
                 if len(audio_array.shape) > 1:
-                    audio_array = audio_array[:, 0]
+                    audio_array = audio_array.mean(axis=1)
 
                 waveform = torch.from_numpy(audio_array.astype(np.float32)).unsqueeze(0)
                 if sr != target_sample_rate:
@@ -212,8 +368,8 @@ def _gpu_worker(
     codec_model_name: str | None,
     audio_tokens_start: int,
     target_sample_rate: int,
-    work_dir: str,
-):
+    cache_namespace: str,
+) -> None:
     """Worker process: process assigned shard files on a specific GPU.
 
     Args:
@@ -223,7 +379,7 @@ def _gpu_worker(
     print(f"[GPU {rank}] Loading {codec_type} codec on {device}...")
     codec = load_codec(codec_type=codec_type, model_name=codec_model_name, device=device)
 
-    out_dir = Path(work_dir) / f"gpu_{rank}"
+    out_dir = Path(cache_namespace) / _CACHE_SHARDS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     process_fn = process_single_parquet if shard_type == "parquet" else process_single_tar
@@ -231,7 +387,7 @@ def _gpu_worker(
 
     for idx, shard_path in enumerate(shard_files):
         shard_name = Path(shard_path).stem
-        out_file = out_dir / f"{shard_name}.pt"
+        out_file = out_dir / cache_shard_filename(shard_path)
 
         # Resume support: skip already-processed shards
         if out_file.exists():
@@ -244,7 +400,7 @@ def _gpu_worker(
         results = process_fn(shard_path, codec, audio_tokens_start, target_sample_rate)
         elapsed = time.time() - t0
 
-        torch.save(results, out_file)
+        atomic_torch_save(results, out_file)
         total_samples += len(results)
 
         print(
@@ -254,6 +410,18 @@ def _gpu_worker(
         )
 
     print(f"[GPU {rank}] Done. Total: {total_samples} samples.")
+
+
+def wait_for_workers(processes: list) -> None:
+    """Join every worker and fail the run when any process exits unsuccessfully."""
+    failures = []
+    for rank, process in enumerate(processes):
+        process.join()
+        if process.exitcode != 0:
+            failures.append(f"GPU {rank} (exit code {process.exitcode})")
+
+    if failures:
+        raise RuntimeError("Tokenization worker failure: " + ", ".join(failures))
 
 
 # ---------------------------------------------------------------------------
@@ -322,15 +490,21 @@ def download_emilia_tars(
 # ---------------------------------------------------------------------------
 
 def build_training_sequences(
-    work_dir: str,
+    cache_namespace: str,
     model_type: str,
     codec_type: str,
     codec_model_name: str | None,
     output_dataset: str,
+    deduplicate_frames: bool = False,
+    completion_only_loss: bool = True,
+    min_dnsmos: float | None = None,
+    min_duration: float | None = None,
+    max_duration: float | None = None,
 ):
-    """Collect tokenized results, build training sequences, push to hub."""
+    """Build training sequences from one selected tokenization namespace."""
     from datasets import Dataset
     from transformers import AutoTokenizer
+
     from vyvotts.audio_tokenizer import remove_duplicate_frames
 
     if model_type == "qwen3":
@@ -361,12 +535,16 @@ def build_training_sequences(
     print(f"Loading tokenizer: {tokenizer_model}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
 
-    pt_files = sorted(Path(work_dir).rglob("*.pt"))
+    pt_files = cache_shard_files(cache_namespace)
     print(f"Found {len(pt_files)} intermediate files")
 
     all_input_ids = []
     all_labels = []
     all_attention_masks = []
+    all_reference_texts = []
+    all_speaker_ids = []
+    all_durations = []
+    all_dnsmos = []
     total_loaded = 0
 
     for pt_file in pt_files:
@@ -376,14 +554,24 @@ def build_training_sequences(
         for sample in results:
             text = sample["text"]
             codes_list = sample["codes_list"]
+            duration = float(sample.get("duration") or 0.0)
+            dnsmos = float(sample.get("dnsmos") or 0.0)
 
             if not codes_list:
                 continue
 
-            try:
-                codes_list = remove_duplicate_frames(codes_list, codes_per_group)
-            except ValueError:
+            if min_dnsmos is not None and dnsmos < min_dnsmos:
                 continue
+            if min_duration is not None and duration < min_duration:
+                continue
+            if max_duration is not None and duration > max_duration:
+                continue
+
+            if deduplicate_frames:
+                try:
+                    codes_list = remove_duplicate_frames(codes_list, codes_per_group)
+                except ValueError:
+                    continue
 
             text_prompt = text
             if sample.get("speaker"):
@@ -404,8 +592,18 @@ def build_training_sequences(
             )
 
             all_input_ids.append(input_ids)
-            all_labels.append(input_ids)
+            if completion_only_loss:
+                prompt_length = 1 + len(text_ids) + 1
+                all_labels.append(
+                    [-100] * prompt_length + input_ids[prompt_length:]
+                )
+            else:
+                all_labels.append(input_ids)
             all_attention_masks.append([1] * len(input_ids))
+            all_reference_texts.append(text)
+            all_speaker_ids.append(sample.get("speaker", ""))
+            all_durations.append(duration)
+            all_dnsmos.append(dnsmos)
 
         if total_loaded % 100_000 == 0 and total_loaded > 0:
             print(f"  Loaded {total_loaded} samples...")
@@ -416,6 +614,10 @@ def build_training_sequences(
         "input_ids": all_input_ids,
         "labels": all_labels,
         "attention_mask": all_attention_masks,
+        "reference_text": all_reference_texts,
+        "speaker_id": all_speaker_ids,
+        "duration": all_durations,
+        "dnsmos": all_dnsmos,
     })
 
     # Save locally or push to hub
@@ -451,6 +653,17 @@ def main():
     parser.add_argument("--codec_type", type=str, default="mimi",
                         choices=["snac", "mimi"])
     parser.add_argument("--codec_model_name", type=str, default=None)
+    parser.add_argument(
+        "--deduplicate_frames", action="store_true",
+        help="Apply legacy lossy frame compression (not recommended)",
+    )
+    parser.add_argument(
+        "--full_sequence_loss", action="store_true",
+        help="Also supervise prompt tokens instead of speech completion only",
+    )
+    parser.add_argument("--min_dnsmos", type=float, default=None)
+    parser.add_argument("--min_duration", type=float, default=None)
+    parser.add_argument("--max_duration", type=float, default=None)
     parser.add_argument("--num_gpus", type=int, default=None,
                         help="Number of GPUs (default: all available)")
     parser.add_argument("--work_dir", type=str, default="/scratch/kadirnar/emilia_tokens",
@@ -486,6 +699,25 @@ def main():
     config_path = config_map[args.model_type]
     config = load_config(config_path)
     audio_tokens_start = config["AUDIO_TOKENS_START"]
+    target_sample_rate = 24000
+    codec_model_name = resolve_codec_model_name(
+        args.codec_type,
+        args.codec_model_name,
+    )
+
+    cache_manifest = make_cache_manifest(
+        shard_files,
+        shard_type=shard_type,
+        dataset=args.dataset,
+        subsets=(args.subsets if args.dataset == "amphion/Emilia-Dataset" else []),
+        model_type=args.model_type,
+        codec_type=args.codec_type,
+        codec_model_name=codec_model_name,
+        audio_tokens_start=audio_tokens_start,
+        target_sample_rate=target_sample_rate,
+    )
+    cache_namespace = prepare_cache_namespace(args.work_dir, cache_manifest)
+    print(f"Cache namespace: {cache_namespace}")
 
     # Step 3: Shard files across GPUs (round-robin)
     tar_shards = [[] for _ in range(num_gpus)]
@@ -496,9 +728,6 @@ def main():
         print(f"  GPU {rank}: {len(tar_shards[rank])} shards")
 
     # Step 4: Multi-GPU encoding
-    work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-
     mp.set_start_method("spawn", force=True)
     processes = []
     for rank in range(num_gpus):
@@ -506,24 +735,26 @@ def main():
             target=_gpu_worker,
             args=(
                 rank, tar_shards[rank], shard_type,
-                args.codec_type, args.codec_model_name,
-                audio_tokens_start, 24000, str(work_dir),
+                args.codec_type, codec_model_name,
+                audio_tokens_start, target_sample_rate, str(cache_namespace),
             ),
         )
         p.start()
         processes.append(p)
 
-    for p in processes:
-        p.join()
-        if p.exitcode != 0:
-            print(f"WARNING: Process exited with code {p.exitcode}")
+    wait_for_workers(processes)
 
     # Step 5: Build training sequences and push to hub
     print("\n--- Building training sequences ---")
     build_training_sequences(
-        str(work_dir), args.model_type,
-        args.codec_type, args.codec_model_name,
+        str(cache_namespace), args.model_type,
+        args.codec_type, codec_model_name,
         args.output_dataset,
+        deduplicate_frames=args.deduplicate_frames,
+        completion_only_loss=not args.full_sequence_loss,
+        min_dnsmos=args.min_dnsmos,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration,
     )
 
 

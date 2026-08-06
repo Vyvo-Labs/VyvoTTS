@@ -147,6 +147,23 @@ The pipeline handles everything: download → tokenize with codec → train → 
 
 See [FINETUNE.md](FINETUNE.md) for the full guide.
 
+### Quality alignment and WER post-training
+
+VyvoTTS includes completion-only, codebook-aware SFT; raw-token DPO, SPO, and
+fine-grained FPO; and waveform-scored REINFORCE/GRPO. The alignment path also
+provides strict codec-token decoding plus lazy ASR, speaker, and quality rewards.
+
+```bash
+python -m vyvotts.train.post_training.sft \
+  --config vyvotts/configs/train/sft_quality.yaml
+python -m vyvotts.train.post_training.online \
+  --config vyvotts/configs/train/grpo_quality.yaml
+```
+
+See [TTS Quality and WER Alignment](docs/ALIGNMENT_TRAINING.md) for dataset
+contracts, preference-pair construction, staged recipes, reward calibration,
+and the mapped 2025–2026 research.
+
 ### Full training (accelerate)
 
 ```bash

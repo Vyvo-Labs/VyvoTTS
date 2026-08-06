@@ -7,7 +7,7 @@ model_name: "Vyvo/VyvoTTS-Qwen3-0.6B-PT"
 epochs: 1
 batch_size: 16
 number_processes: 1
-pad_token: 64407
+pad_token: 151676
 save_steps: 5000
 learning_rate: 5.0e-5
 
