@@ -17,12 +17,15 @@ dependencies = [
     "soundfile",
     "librosa",
     "torchaudio",
+    "torchcodec",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
 vllm = ["vllm>=0.18"]
 sglang = ["sglang[all]", "sgl-kernel"]
-train = ["unsloth", "wandb", "trl", "kernels", "liger_kernel"]
+train = ["unsloth", "wandb", "trl", "peft", "kernels", "liger_kernel"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["vyvotts*"]

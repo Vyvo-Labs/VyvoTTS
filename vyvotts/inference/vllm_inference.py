@@ -4,6 +4,7 @@ from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
 from vyvotts.inference.base import BaseVyvoTTSInference
+from vyvotts.inference.constraints import include_end_token_for_stop
 
 
 class VyvoTTSInference(BaseVyvoTTSInference):
@@ -15,7 +16,7 @@ class VyvoTTSInference(BaseVyvoTTSInference):
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
         tokenizer_name: Optional[str] = None,
-        codec_type: str = "snac",
+        codec_type: Optional[str] = None,
         codec_model_name: str = None,
         enforce_eager: bool = False,
         max_model_len: int = 2048,
@@ -59,7 +60,15 @@ class VyvoTTSInference(BaseVyvoTTSInference):
             [{"prompt_token_ids": prompt_ids[0].tolist()}],
             [params],
         )
-        token_ids = outputs[0].outputs[0].token_ids
+        completion = outputs[0].outputs[0]
+        token_ids = include_end_token_for_stop(
+            completion.token_ids,
+            self.END_OF_SPEECH,
+            {
+                "type": getattr(completion, "finish_reason", None),
+                "matched": getattr(completion, "stop_reason", None),
+            },
+        )
         generated_ids = torch.tensor([token_ids], dtype=torch.long)
 
         audio_samples = self._extract_audio_from_tokens(generated_ids)

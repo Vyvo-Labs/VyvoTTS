@@ -1,6 +1,8 @@
-import torch
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import List, Optional
+
+import torch
 
 
 class BaseCodec(ABC):
@@ -25,7 +27,7 @@ class BaseCodec(ABC):
         ...
 
     @abstractmethod
-    def encode(self, waveform: torch.Tensor) -> List[int]:
+    def encode(self, waveform: torch.Tensor) -> list[int]:
         """Encode waveform to interleaved code list with per-codebook offsets.
 
         Args:
@@ -37,7 +39,7 @@ class BaseCodec(ABC):
         ...
 
     @abstractmethod
-    def decode(self, code_list: List[int], device: str = "cpu") -> Optional[torch.Tensor]:
+    def decode(self, code_list: list[int], device: str = "cpu") -> torch.Tensor | None:
         """Decode interleaved code list back to audio waveform.
 
         Args:
@@ -87,7 +89,7 @@ class SNACCodec(BaseCodec):
     def sample_rate(self) -> int:
         return 24000
 
-    def encode(self, waveform: torch.Tensor) -> List[int]:
+    def encode(self, waveform: torch.Tensor) -> list[int]:
         with torch.inference_mode():
             codes = self.model.encode(waveform.to(self.device))
 
@@ -104,7 +106,7 @@ class SNACCodec(BaseCodec):
             ])
         return all_codes
 
-    def decode(self, code_list: List[int], device: str = "cpu") -> Optional[torch.Tensor]:
+    def decode(self, code_list: list[int], device: str = "cpu") -> torch.Tensor | None:
         num_groups = len(code_list) // self.codes_per_group
         if num_groups == 0:
             return None
@@ -125,10 +127,19 @@ class SNACCodec(BaseCodec):
             codes[:, 6] - 6 * 4096,
         ], dim=1).reshape(-1).clamp(0, 4095)
 
-        snac_codes = [layer.unsqueeze(0).to(device) for layer in (layer_0, layer_1, layer_2)]
-        if self._optimized_decode:
-            return self._optimized_decode(snac_codes)
-        return self.model.decode(snac_codes)
+        # Decode where the codec model lives, then move only the finished
+        # waveform to the caller's requested output device. Treating
+        # ``device`` as both values breaks CUDA-codec/CPU-reward pipelines.
+        snac_codes = [
+            layer.unsqueeze(0).to(self.device)
+            for layer in (layer_0, layer_1, layer_2)
+        ]
+        with torch.inference_mode():
+            if self._optimized_decode is not None:
+                audio = self._optimized_decode(snac_codes)
+            else:
+                audio = self.model.decode(snac_codes)
+        return audio.to(device)
 
 
 class MimiCodec(BaseCodec):
@@ -158,7 +169,7 @@ class MimiCodec(BaseCodec):
     def sample_rate(self) -> int:
         return 24000
 
-    def encode(self, waveform: torch.Tensor) -> List[int]:
+    def encode(self, waveform: torch.Tensor) -> list[int]:
         waveform = waveform.to(self.device)
         with torch.inference_mode():
             encoder_outputs = self.model.encode(waveform, num_quantizers=self._num_codebooks)
@@ -173,7 +184,7 @@ class MimiCodec(BaseCodec):
                 all_codes.append(audio_codes[k, t].item() + k * self.codebook_size)
         return all_codes
 
-    def decode(self, code_list: List[int], device: str = "cpu") -> Optional[torch.Tensor]:
+    def decode(self, code_list: list[int], device: str = "cpu") -> torch.Tensor | None:
         num_groups = len(code_list) // self.codes_per_group
         if num_groups == 0:
             return None
@@ -200,7 +211,7 @@ class MimiCodec(BaseCodec):
 
 def load_codec(
     codec_type: str = "snac",
-    model_name: str = None,
+    model_name: str | None = None,
     device: str = "cpu",
     optimize: bool = False,
     **kwargs,

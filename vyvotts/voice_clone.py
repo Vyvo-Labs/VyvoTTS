@@ -7,9 +7,14 @@ import librosa
 import numpy as np
 from scipy.io.wavfile import write
 from huggingface_hub import login
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
-from vyvotts.codec import load_codec, BaseCodec
+from vyvotts.codec import load_codec
+from vyvotts.inference.constraints import (
+    AudioTokenLogitsProcessor,
+    AudioTokenSequenceError,
+    extract_audio_codes,
+)
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -29,7 +34,7 @@ class VyvoTTSVoiceClone:
         config: Optional[Dict[str, Any]] = None,
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-LFM2-Neuvillette",
-        codec_type: str = "snac",
+        codec_type: Optional[str] = None,
         codec_model_name: str = None,
         device: str = "cuda"
     ):
@@ -67,7 +72,17 @@ class VyvoTTSVoiceClone:
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._load_model()
-        self.codec = load_codec(codec_type=codec_type, model_name=codec_model_name, device="cpu")
+        codec_type = codec_type or self.config.get("CODEC_TYPE", "snac")
+        codec_model_name = codec_model_name or self.config.get("CODEC_MODEL")
+        codec_kwargs = {}
+        if codec_type == "mimi" and self.config.get("NUM_CODEBOOKS") is not None:
+            codec_kwargs["num_codebooks"] = self.config["NUM_CODEBOOKS"]
+        self.codec = load_codec(
+            codec_type=codec_type,
+            model_name=codec_model_name,
+            device="cpu",
+            **codec_kwargs,
+        )
 
     def _setup_token_constants(self):
         """Setup token constants from configuration."""
@@ -94,6 +109,7 @@ class VyvoTTSVoiceClone:
             torch_dtype=torch.bfloat16
         )
         model.to(self.device)
+        model.eval()
         return model
 
     def encode_reference_audio(self, audio_file_path: str) -> List[int]:
@@ -135,9 +151,18 @@ class VyvoTTSVoiceClone:
         # Encode reference audio
         audio_tokens = self.encode_reference_audio(reference_audio_path)
 
-        # Special tokens
+        if not target_texts:
+            raise ValueError("target_texts must contain at least one item")
+
+        # Special tokens. Reference speech is fully framed; target generation
+        # ends at END_OF_HUMAN so the decoder must emit both output headers.
         start_token = torch.tensor([[self.START_OF_HUMAN]], dtype=torch.int64)
-        mid_tokens = torch.tensor([[self.END_OF_TEXT, self.END_OF_HUMAN, self.START_OF_AI]], dtype=torch.int64)
+        text_end_tokens = torch.tensor(
+            [[self.END_OF_TEXT, self.END_OF_HUMAN]], dtype=torch.int64,
+        )
+        speech_start_tokens = torch.tensor(
+            [[self.START_OF_AI, self.START_OF_SPEECH]], dtype=torch.int64,
+        )
         final_tokens = torch.tensor([[self.END_OF_SPEECH, self.END_OF_AI]], dtype=torch.int64)
 
         # Tokenize reference transcript
@@ -148,7 +173,8 @@ class VyvoTTSVoiceClone:
         reference_prompt = torch.cat([
             start_token,
             ref_input_ids,
-            mid_tokens,
+            text_end_tokens,
+            speech_start_tokens,
             torch.tensor([audio_tokens], dtype=torch.int64),
             final_tokens
         ], dim=1)
@@ -161,7 +187,7 @@ class VyvoTTSVoiceClone:
                 reference_prompt,
                 start_token,
                 text_tokens,
-                mid_tokens
+                text_end_tokens,
             ], dim=1)
             all_input_ids.append(full_input)
 
@@ -202,7 +228,9 @@ class VyvoTTSVoiceClone:
         max_new_tokens: int = 990,
         temperature: float = 0.5,
         top_p: float = 0.9,
-        repetition_penalty: float = 1.1
+        repetition_penalty: float = 1.1,
+        constrained_decoding: bool = True,
+        min_audio_frames: int = 1,
     ) -> torch.Tensor:
         """Generate speech tokens using the model.
 
@@ -213,10 +241,28 @@ class VyvoTTSVoiceClone:
             temperature: Sampling temperature
             top_p: Top-p sampling parameter
             repetition_penalty: Repetition penalty
+            constrained_decoding: Enforce codec token ranges and frame boundaries.
+            min_audio_frames: Minimum complete frames before speech may end.
 
         Returns:
             Generated token IDs
         """
+        logits_processor = LogitsProcessorList()
+        if constrained_decoding:
+            logits_processor.append(
+                AudioTokenLogitsProcessor(
+                    prompt_length=input_ids.shape[1],
+                    start_of_ai=self.START_OF_AI,
+                    start_of_speech=self.START_OF_SPEECH,
+                    end_of_speech=self.END_OF_SPEECH,
+                    audio_tokens_start=self.AUDIO_TOKENS_START,
+                    codes_per_group=self.codec.codes_per_group,
+                    codebook_size=self.codec.codebook_size,
+                    pad_token_id=self.PAD_TOKEN,
+                    min_audio_frames=min_audio_frames,
+                )
+            )
+
         with torch.no_grad():
             generated_ids = self.model.generate(
                 input_ids=input_ids,
@@ -228,12 +274,13 @@ class VyvoTTSVoiceClone:
                 repetition_penalty=repetition_penalty,
                 num_return_sequences=1,
                 eos_token_id=self.END_OF_SPEECH,
-                pad_token_id=self.PAD_TOKEN
+                pad_token_id=self.PAD_TOKEN,
+                logits_processor=logits_processor,
             )
 
         return generated_ids
 
-    def decode_audio_tokens(self, generated_ids: torch.Tensor) -> List[torch.Tensor]:
+    def decode_audio_tokens(self, generated_ids: torch.Tensor) -> List[Optional[torch.Tensor]]:
         """Convert generated token IDs to audio waveforms.
 
         Args:
@@ -242,34 +289,27 @@ class VyvoTTSVoiceClone:
         Returns:
             List of decoded audio tensors
         """
-        codes_per_group = self.codec.codes_per_group
+        if generated_ids.ndim == 1:
+            generated_ids = generated_ids.unsqueeze(0)
+        if generated_ids.ndim != 2:
+            raise ValueError("generated_ids must be a rank-1 or rank-2 tensor")
 
-        # Find start of audio tokens
-        audio_start_indices = (generated_ids == self.START_OF_AI).nonzero(as_tuple=True)
+        audio_samples: List[Optional[torch.Tensor]] = []
+        for row in generated_ids:
+            try:
+                code_list = extract_audio_codes(
+                    row,
+                    start_of_speech=self.START_OF_SPEECH,
+                    end_of_speech=self.END_OF_SPEECH,
+                    audio_tokens_start=self.AUDIO_TOKENS_START,
+                    codes_per_group=self.codec.codes_per_group,
+                    codebook_size=self.codec.codebook_size,
+                )
+            except AudioTokenSequenceError:
+                audio_samples.append(None)
+                continue
 
-        if len(audio_start_indices[1]) > 0:
-            last_start_idx = audio_start_indices[1][-1].item()
-            cropped_tokens = generated_ids[:, last_start_idx + 1:]
-        else:
-            cropped_tokens = generated_ids
-
-        # Remove end tokens and process each sequence
-        audio_samples = []
-        for row in cropped_tokens:
-            # Remove end of speech tokens
-            clean_tokens = row[row != self.END_OF_SPEECH]
-
-            # Group into chunks of codes_per_group
-            token_length = clean_tokens.size(0)
-            grouped_length = (token_length // codes_per_group) * codes_per_group
-            trimmed_tokens = clean_tokens[:grouped_length]
-
-            # Convert to code list with offset correction
-            code_list = [t.item() - self.AUDIO_TOKENS_START for t in trimmed_tokens]
-
-            if code_list:
-                audio = self.codec.decode(code_list)
-                audio_samples.append(audio)
+            audio_samples.append(self.codec.decode(code_list))
 
         return audio_samples
 
@@ -278,7 +318,7 @@ class VyvoTTSVoiceClone:
         reference_audio_path: str,
         reference_transcript: str,
         target_texts: List[str]
-    ) -> List[np.ndarray]:
+    ) -> List[Optional[np.ndarray]]:
         """Clone a voice using reference audio and generate speech for target texts.
 
         Args:
@@ -303,7 +343,9 @@ class VyvoTTSVoiceClone:
         # Convert to numpy arrays
         audio_arrays = []
         for tensor in audio_tensors:
-            if isinstance(tensor, torch.Tensor):
+            if tensor is None:
+                audio_array = None
+            elif isinstance(tensor, torch.Tensor):
                 audio_array = tensor.detach().squeeze().cpu().numpy()
             else:
                 audio_array = np.squeeze(tensor)
@@ -313,7 +355,7 @@ class VyvoTTSVoiceClone:
 
     def save_audio(
         self,
-        audio_arrays: List[np.ndarray],
+        audio_arrays: List[Optional[np.ndarray]],
         output_paths: List[str],
         sample_rate: int = None
     ):
@@ -327,6 +369,9 @@ class VyvoTTSVoiceClone:
         sample_rate = sample_rate or self.SAMPLE_RATE
 
         for audio_array, output_path in zip(audio_arrays, output_paths):
+            if audio_array is None:
+                print(f"Skipping invalid generated audio for: {output_path}")
+                continue
             # Ensure output directory exists
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 

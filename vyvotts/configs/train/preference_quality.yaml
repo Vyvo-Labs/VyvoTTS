@@ -1,0 +1,39 @@
+# Raw-token offline preference alignment. Use dpo, spo, or fpo.
+model:
+  name_or_path: outputs/alignment/sft/final
+  reference_name_or_path: outputs/alignment/sft/final  # required by DPO/FPO
+  tokenizer_name_or_path: outputs/alignment/sft/final
+  dtype: bfloat16
+  attn_implementation: sdpa
+
+data:
+  dataset: outputs/preferences.jsonl
+  split: train
+  pad_token_id: 64407
+  max_length: 8192
+  padding_side: right
+
+preference:
+  objective: dpo
+  beta: 0.1
+  label_smoothing: 0.0
+  length_normalize_dpo: false
+  # Used only by FPO:
+  fpo_mask_combine: union
+  fpo_token_reduction: sum
+  # SPO defaults are beta=2.5 and gamma=0.8 when beta is omitted.
+
+training:
+  output_dir: outputs/alignment/preference
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-7
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 2
+  bf16: true
+  gradient_checkpointing: true
+  report_to: none

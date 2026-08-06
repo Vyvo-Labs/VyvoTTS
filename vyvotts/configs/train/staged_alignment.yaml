@@ -1,0 +1,43 @@
+# Resolve every technique as a branched experiment. Review resolved configs,
+# disable unwanted branches, then set dry_run: false to launch training.
+initial_model: outputs/pretrain/final
+output_root: outputs/alignment/staged
+dry_run: true
+
+stages:
+  - name: sft
+    method: sft
+    config: sft_quality.yaml
+    accelerate: true
+
+  # Offline objectives branch from the identical SFT checkpoint for a fair ablation.
+  - name: dpo
+    method: dpo
+    input_from: sft
+    config: preference_quality.yaml
+    accelerate: true
+
+  - name: spo
+    method: spo
+    input_from: sft
+    config: preference_quality.yaml
+    accelerate: true
+
+  - name: fpo
+    method: fpo
+    input_from: sft
+    config: preference_quality.yaml
+    accelerate: true
+
+  # Online RL variants branch from FPO here; point input_from at the best
+  # DPO/SPO/FPO validation checkpoint in a real experiment.
+  - name: reinforce
+    method: reinforce
+    input_from: fpo
+    config: grpo_quality.yaml
+    accelerate: true
+  - name: grpo
+    method: grpo
+    input_from: fpo
+    config: grpo_quality.yaml
+    accelerate: true

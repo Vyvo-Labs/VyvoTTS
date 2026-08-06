@@ -1,0 +1,21 @@
+# Each input JSONL row contains prompt_input_ids and a list of scored candidates.
+input_jsonl: outputs/candidates.jsonl
+output_jsonl: outputs/preferences.jsonl
+minimum_reward_gap: 0.30
+weight_by_gap: false
+codes_per_group: 8
+audio_start_index: 2
+
+reward:
+  weights:
+    intelligibility_reward: 0.45
+    speaker_reward: 0.45
+    quality_reward: 0.10
+  maximize:
+    wer: min
+    cer: min
+  pareto_metrics: [intelligibility_reward, speaker_reward, quality_reward]
+  protected_metrics: [speaker_reward, quality_reward]
+  protected_tolerances:
+    speaker_reward: 0.02
+    quality_reward: 0.03

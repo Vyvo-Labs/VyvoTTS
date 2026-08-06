@@ -1,0 +1,30 @@
+# Completion-only SFT after pretraining. Replace model/dataset paths.
+model_name: outputs/pretrain/final
+tokenizer_name: outputs/pretrain/final
+inference_config: vyvotts/configs/inference/lfm2_5.yaml
+dataset: outputs/tokenized_sft
+split: train
+output_dir: outputs/alignment/sft
+
+# Mimi defaults. For SNAC use codes_per_group: 7 and codebook_size: 4096.
+codes_per_group: 8
+codebook_size: 2048
+codebook_weights: [1.50, 1.20, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00]
+boundary_weight: 1.25
+label_smoothing: 0.0
+trust_dataset_labels: false
+dtype: bfloat16
+
+training_args:
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-5
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 2
+  bf16: true
+  gradient_checkpointing: true
+  report_to: none

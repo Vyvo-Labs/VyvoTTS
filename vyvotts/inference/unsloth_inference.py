@@ -1,6 +1,7 @@
 import torch
 from typing import Optional, Dict, Any
 from unsloth import FastLanguageModel
+from transformers import LogitsProcessorList
 
 from vyvotts.inference.base import BaseVyvoTTSInference
 
@@ -18,7 +19,7 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
         config_path: Optional[str] = None,
         model_name: str = "Vyvo/VyvoTTS-v2-Neuvillette",
         tokenizer_name: Optional[str] = None,
-        codec_type: str = "snac",
+        codec_type: Optional[str] = None,
         codec_model_name: str = None,
         max_seq_length: int = 8192,
         load_in_4bit: bool = False,
@@ -48,6 +49,9 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
         repetition_penalty: float = 1.1,
         do_sample: bool = True,
         output_path: Optional[str] = None,
+        constrained_decoding: bool = True,
+        min_audio_frames: int = 1,
+        use_random_voice: bool = False,
     ) -> Optional[torch.Tensor]:
         """Generate speech from text input.
 
@@ -60,12 +64,23 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
             repetition_penalty: Penalty for token repetition.
             do_sample: Whether to use sampling.
             output_path: Optional path to save audio file.
+            constrained_decoding: Enforce codec token ranges and frame boundaries.
+            min_audio_frames: Minimum complete frames before speech may end.
+            use_random_voice: Select a random known speaker when voice is omitted.
 
         Returns:
             Audio tensor containing the generated speech, or None on failure.
         """
-        input_ids = self._build_prompt_tokens(text, voice).to("cuda")
+        input_ids = self._build_prompt_tokens(
+            text, voice, use_random_voice=use_random_voice,
+        ).to("cuda")
         attention_mask = torch.ones_like(input_ids)
+
+        logits_processor = LogitsProcessorList()
+        if constrained_decoding:
+            logits_processor.append(
+                self._audio_logits_processor(input_ids.shape[1], min_audio_frames)
+            )
 
         with torch.no_grad():
             generated_ids = self.model.generate(
@@ -78,6 +93,8 @@ class VyvoTTSUnslothInference(BaseVyvoTTSInference):
                 repetition_penalty=repetition_penalty,
                 num_return_sequences=1,
                 eos_token_id=self.END_OF_SPEECH,
+                pad_token_id=self.PAD_TOKEN,
+                logits_processor=logits_processor,
                 use_cache=True,
             )
 

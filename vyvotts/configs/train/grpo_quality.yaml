@@ -1,0 +1,43 @@
+# On-policy waveform-scored GRPO. Replace model/dataset paths.
+model_name: outputs/alignment/preference/final
+reference_model_name: outputs/alignment/preference/final
+tokenizer_name: outputs/alignment/preference/final
+inference_config: vyvotts/configs/inference/lfm2_5.yaml
+codec_type: mimi
+codec_device: cpu
+dataset: outputs/online_prompts
+split: train
+text_column: reference_text
+speaker_column: speaker_id
+reference_audio_column: audio
+output_dir: outputs/alignment/grpo
+
+training:
+  method: grpo
+  group_size: 8
+  max_steps: 1000
+  max_new_tokens: 1200
+  min_audio_frames: 4
+  temperature: 0.7
+  top_p: 0.95
+  learning_rate: 1.0e-5
+  clip_epsilon: 0.2
+  policy_updates: 1
+  # Start at zero; enable only after monitoring reward/KL curves.
+  kl_beta: 0.0
+  normalize_advantages: false
+  save_steps: 100
+
+reward:
+  device: cuda
+  weights:
+    intelligibility_reward: 0.45
+    speaker_reward: 0.45
+    quality_reward: 0.10
+  asr:
+    model_name: openai/whisper-large-v3
+    normalizer: basic
+  speaker:
+    model_name: microsoft/wavlm-base-plus-sv
+  quality: true
+  normalize_weights: true
