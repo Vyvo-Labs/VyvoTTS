@@ -153,6 +153,18 @@ VyvoTTS includes completion-only, codebook-aware SFT; raw-token DPO, SPO, and
 fine-grained FPO; and waveform-scored REINFORCE/GRPO. The alignment path also
 provides strict codec-token decoding plus lazy ASR, speaker, and quality rewards.
 
+On the fixed 1,088-utterance Seed-TTS English evaluation, continuing standard
+completion SFT with codebook- and speech-boundary-weighted SFT improved macro
+WER as follows:
+
+| Training stage | Macro WER |
+|---|---:|
+| Standard completion SFT | 1.543153% |
+| **+ Codebook-boundary SFT** | **1.463962%** |
+
+See the [current-pretrain WER campaign report](docs/experiments/QWEN3_CURRENT_PRETRAIN_WER_CAMPAIGN.md)
+for the fixed evaluation protocol and all post-training results.
+
 ```bash
 python -m vyvotts.train.post_training.sft \
   --config vyvotts/configs/train/sft_quality.yaml
