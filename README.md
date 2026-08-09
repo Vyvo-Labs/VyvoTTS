@@ -156,15 +156,10 @@ VyvoTTS supports codebook-aware SFT, preference alignment, and online RL.
 | Standard completion SFT | 1.543153% | 1.507836% |
 | **+ Codebook-boundary SFT** | **1.463962%** | **1.448539%** |
 
-| Training stage | Quality score ↑ | PESQ ↑ | STOI ↑ | SI-SDR (dB) ↑ | Speaker cosine ↑ | Signal score ↑ | Clipping rate ↓ | Silence rate ↓ |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Standard completion SFT | 0.947781 | 4.0778 | **0.997197** | **26.8943** | **0.948547** | 0.958459 | 0 | 0.114715 |
-| **+ Codebook-boundary SFT** | **0.949792** | **4.0983** | 0.997186 | 26.7730 | 0.947367 | **0.959322** | 0 | **0.113211** |
-
-| Training stage | DNSMOS SIG ↑ | DNSMOS BAK ↑ | DNSMOS OVRL ↑ | P808 MOS ↑ |
-|---|---:|---:|---:|---:|
-| Standard completion SFT | **3.590586** | **3.952479** | **3.257910** | 3.797135 |
-| **+ Codebook-boundary SFT** | 3.576516 | 3.913593 | 3.223899 | **3.815376** |
+| Training stage | Quality score ↑ | PESQ ↑ | STOI ↑ | SI-SDR (dB) ↑ | Speaker cosine ↑ | Signal score ↑ | Clipping rate ↓ | Silence rate ↓ | DNSMOS ↑ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Standard completion SFT | 0.947781 | 4.0778 | **0.997197** | **26.8943** | **0.948547** | 0.958459 | 0 | 0.114715 | **3.257910** |
+| **+ Codebook-boundary SFT** | **0.949792** | **4.0983** | 0.997186 | 26.7730 | 0.947367 | **0.959322** | 0 | **0.113211** | 3.223899 |
 
 See the [training guide](docs/ALIGNMENT_TRAINING.md) for examples and the
 [experiment report](docs/experiments/QWEN3_CURRENT_PRETRAIN_WER_CAMPAIGN.md)
