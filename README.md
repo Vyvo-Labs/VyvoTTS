@@ -149,32 +149,16 @@ See [FINETUNE.md](FINETUNE.md) for the full guide.
 
 ### Quality alignment and WER post-training
 
-VyvoTTS includes completion-only, codebook-aware SFT; raw-token DPO, SPO, and
-fine-grained FPO; and waveform-scored REINFORCE/GRPO. The alignment path also
-provides strict codec-token decoding plus lazy ASR, speaker, and quality rewards.
+VyvoTTS supports codebook-aware SFT, preference alignment, and online RL.
 
-On the fixed 1,088-utterance Seed-TTS English evaluation, continuing standard
-completion SFT with codebook- and speech-boundary-weighted SFT improved macro
-WER as follows:
+| Training stage | Macro WER ↓ | Quality score ↑ | PESQ ↑ |
+|---|---:|---:|---:|
+| Standard completion SFT | 1.543153% | 0.947781 | 4.0778 |
+| **+ Codebook-boundary SFT** | **1.463962%** | **0.949792** | **4.0983** |
 
-| Training stage | Macro WER |
-|---|---:|
-| Standard completion SFT | 1.543153% |
-| **+ Codebook-boundary SFT** | **1.463962%** |
-
-See the [current-pretrain WER campaign report](docs/experiments/QWEN3_CURRENT_PRETRAIN_WER_CAMPAIGN.md)
-for the fixed evaluation protocol and all post-training results.
-
-```bash
-python -m vyvotts.train.post_training.sft \
-  --config vyvotts/configs/train/sft_quality.yaml
-python -m vyvotts.train.post_training.online \
-  --config vyvotts/configs/train/grpo_quality.yaml
-```
-
-See [TTS Quality and WER Alignment](docs/ALIGNMENT_TRAINING.md) for dataset
-contracts, preference-pair construction, staged recipes, reward calibration,
-and the mapped 2025–2026 research.
+See the [training guide](docs/ALIGNMENT_TRAINING.md) for examples and the
+[experiment report](docs/experiments/QWEN3_CURRENT_PRETRAIN_WER_CAMPAIGN.md)
+for the full protocol and results.
 
 ### Full training (accelerate)
 
