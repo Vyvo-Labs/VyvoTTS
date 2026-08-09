@@ -38,6 +38,12 @@ is reported as a secondary metric. Voice quality was measured on the same
 fixed 64-utterance subset using PESQ, STOI, signal checks, and WavLM speaker
 similarity. All stages used identical inference and scoring settings.
 
+DNSMOS used [Microsoft's official non-personalized P.835 local
+implementation](https://github.com/microsoft/DNS-Challenge/tree/591184a9fcb2cbdec02520fed81a32bbbf9d73ff/DNSMOS),
+evaluated on the same 64 utterances per stage. SIG, BAK, OVRL, and P808 MOS are
+1–5 scores where higher is better. They are non-intrusive quality proxies, not
+human TTS MOS ratings.
+
 ## Results
 
 | Stage | Method | Macro WER (%) | Corpus WER (%) | Quality | Decision |
@@ -55,6 +61,29 @@ similarity. All stages used identical inference and scoring settings.
 | Targeted unlikelihood | Preference | 1.603151 | 1.584075 | 0.948773 | Not promoted |
 | REINFORCE | Online RL | 1.562307 | 1.524778 | 0.949305 | Not promoted |
 | GRPO | Online RL | 1.499197 | 1.473952 | 0.944718 | Not promoted |
+
+### DNSMOS P.835
+
+| Stage | SIG ↑ | BAK ↑ | OVRL ↑ | P808 MOS ↑ |
+|---|---:|---:|---:|---:|
+| Pretrain | 2.350581 | 2.919683 | 1.919922 | 2.911113 |
+| Completion SFT | 3.590586 | 3.952479 | 3.257910 | 3.797135 |
+| Codebook-boundary SFT | 3.576516 | 3.913593 | 3.223899 | 3.815376 |
+| CFG SFT | 3.572871 | 3.910140 | 3.215698 | 3.816541 |
+| Qwen self-distillation | 3.591676 | 3.970697 | 3.268373 | 3.812025 |
+| DPO | 3.573222 | 3.944267 | 3.239253 | 3.822209 |
+| **RPO** | **3.595195** | 3.952092 | 3.261122 | 3.803329 |
+| SPO | 3.579954 | 3.928548 | 3.235983 | 3.821345 |
+| FPO | 3.577494 | 3.924667 | 3.230782 | 3.814571 |
+| TKTO | 3.577596 | 3.919813 | 3.228371 | 3.781382 |
+| Targeted unlikelihood | 3.583289 | 3.949865 | 3.248273 | 3.782860 |
+| **REINFORCE** | 3.592964 | **3.975129** | **3.274036** | 3.807516 |
+| **GRPO** | 3.581214 | 3.967238 | 3.257930 | **3.845563** |
+
+REINFORCE had the highest DNSMOS OVRL, while GRPO had the highest P808 MOS.
+Neither was promoted because both had worse full-set WER than the boundary-SFT
+champion; DNSMOS was added as a post-hoc quality diagnostic, not a replacement
+for the fixed promotion criteria.
 
 Self-distillation generated 2,048 candidates from 512 prompts and retained 365
 exact-ASR groups. The shared preference campaign generated 3,072 candidates
@@ -75,6 +104,7 @@ The campaign is defined by
 stored under `outputs/qwen3_current_pretrain_wer_campaign/`. The champion LoRA
 adapter is in `training/02-codebook_boundary_sft/final/`, while every rejected
 adapter and its full evaluation are retained for audit. The complete campaign
-occupies approximately 14 GB. Repository verification completed with 204/204
-pytest tests passing, and all Python files changed for the campaign passing
-Ruff.
+occupies approximately 14 GB. DNSMOS summaries, per-utterance events, and the
+compact table are stored in `dnsmos/summary.json`, `dnsmos/events/`, and
+`dnsmos/results.tsv`. Repository verification completed with 204/204 pytest
+tests passing, and all Python files changed for the campaign passing Ruff.
